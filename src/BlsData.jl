@@ -2,15 +2,18 @@ isdefined(Base, :__precompile__) && __precompile__()
 
 module BlsData
 
-using Requests
+using Compat
 using DataFrames
+
+import Dates
 import JSON
 import HttpCommon
-using Compat
+import HTTP
+import Printf: @printf
 
-export 
+export
     # Bls type
-    Bls, get_api_url, set_api_url!, get_api_key, get_api_version, requests_made, 
+    Bls, get_api_url, set_api_url!, get_api_key, get_api_version, requests_made,
         requests_remaining,
     # BlsSeries type
     BlsSeries,
@@ -45,8 +48,10 @@ function log_error(url, payload, headers, response)
             println(f, JSON.json(payload))
             println(f, headers)
             println(f, "Response")
-            println(f, Requests.text(response))
+            println(f, String(response))
         end
+    catch e
+        # pass
     end
 end
 
@@ -78,17 +83,17 @@ Notes
   catalog metadata available.
 
 """
-type Bls
+mutable struct Bls
     url::AbstractString
     key::AbstractString
     n_requests::Int16
-    t_created::DateTime
+    t_created::Dates.DateTime
 end
 function Bls(key="")
     if isempty(key)
         try
-            open(joinpath(homedir(),".blsdatarc"), "r") do f
-                key = readstring(f)
+            key = open(joinpath(homedir(),".blsdatarc"), "r") do f
+                read(f, String)
             end
             key = rstrip(key)
             @printf "API key loaded.\n"
@@ -106,7 +111,7 @@ function Bls(key="")
 
     url = DEFAULT_API_URL
     n_requests = 0
-    t_created = now()
+    t_created = Dates.now()
     Bls(url, key, n_requests, t_created)
 end
 
@@ -119,8 +124,8 @@ requests_remaining(b::Bls) = LIMIT_DAILY_QUERY[get_api_version(b)] - requests_ma
 
 function increment_requests!(b::Bls)
     # Reset request if we are in a new day!
-    if Dates.day(now()) ≠ Dates.day(b.t_created)
-        b.t_created = now()
+    if Dates.day(Dates.now()) ≠ Dates.day(b.t_created)
+        b.t_created = Dates.now()
         b.n_requests = 0
     end
 
@@ -145,7 +150,7 @@ s.data
 s.catalog
 ```
 """
-type BlsSeries
+mutable struct BlsSeries
     id::AbstractString
     data::DataFrame
     catalog::AbstractString
@@ -154,14 +159,14 @@ end
 function Base.show(io::IO, s::BlsSeries)
     @printf io "BlsSeries\n"
     @printf io "\tid: %s\n" s.id
-    @printf io "\tseries: %dx%d DataFrame with columns %s\n" size(s.data)...  names(s.data) 
+    @printf io "\tdata: %dx%d DataFrame with columns %s\n" size(s.data)...  names(s.data)
     @printf io "\tcatalog: %s\n" s.catalog
 end
 
 EMPTY_RESPONSE() = BlsSeries("",DataFrame(),"")
 function Base.isempty(s::BlsSeries)
-    for name in fieldnames(s)
-        if !isempty(getfield(s, name))
+    for name in propertynames(s)
+        if !isempty(getproperty(s, name))
             return false
         end
     end
@@ -169,7 +174,7 @@ function Base.isempty(s::BlsSeries)
 end
 
 # deprecated
-export 
+export
     api_url, api_key, api_version,
     id, series, catalog
 @deprecate api_url(b::Bls) get_api_url(b)

@@ -20,15 +20,14 @@ A `BlsSeries`, or an array of `BlsSeries`.
 function get_data(b::Bls, series::AbstractString; kwargs...)
    return get_data(b, [series]; kwargs...)
 end
-function get_data{T<:AbstractString}(b::Bls, series::Array{T, 1};
-                                     startyear::Int = typemin(Int),
-                                     endyear::Int   = typemin(Int),
-                                     catalog::Bool  = false)
-
+function get_data(b::Bls, series::Array{T, 1};
+                  startyear::Int = typemin(Int),
+                  endyear::Int   = typemin(Int),
+                  catalog::Bool  = false) where {T<:AbstractString}
     # Resolve default and user-specified date ranges
     if startyear == endyear == typemin(Int)
         # If neither startyear nor endyear is specified
-        endyear = Int(Dates.year(now()))
+        endyear = Int(Dates.year(Dates.now()))
         startyear = endyear - (LIMIT_YEARS_PER_QUERY[get_api_version(b)]-1)
     elseif startyear == typemin(Int) && endyear ≠ typemin(Int)
         # If only endyear is specified
@@ -38,13 +37,13 @@ function get_data{T<:AbstractString}(b::Bls, series::Array{T, 1};
         endyear = startyear + (LIMIT_YEARS_PER_QUERY[get_api_version(b)]-1)
     end
     @assert endyear > startyear
-    @assert startyear ≤ Int(Dates.year(now()))
+    @assert startyear ≤ Int(Dates.year(Dates.now()))
 
     # Make multiple requests for year range greater than limit
     limit = LIMIT_YEARS_PER_QUERY[get_api_version(b)]
     nrequests = div(endyear-startyear, limit) + 1
     if nrequests > requests_remaining(b)
-        warn("Insufficient number of requests remaining ", "(", nrequests, " needed ", 
+        println("Insufficient number of requests remaining ", "(", nrequests, " needed ",
             requests_remaining(b), " remaining).")
         return if length(series) > 1
             [EMPTY_RESPONSE() for i in 1:length(series)]
@@ -90,12 +89,12 @@ function append_result!(data, result)
     for i=1:length(result)
         # Simply don't attempt to append empty results
         if isempty(result[i])
-            warn("Empty response from server ignored.")
+            println("Empty response from server ignored.")
             continue
         end
 
         @assert result[i].id==data[i].id
-        
+
         # It's possible that the first df, from 'data', has no rows but differently typed
         # columns from the second df. In this case, we ditch the first df entirely.
         if nrow(data[i].data) > 0
@@ -111,10 +110,18 @@ function append_result!(data, result)
     end
 end
 
-# Worker method for a single request
-function _get_data{T<:AbstractString}(b::Bls, series::Array{T,1}, 
-                                      startyear::Int, endyear::Int, catalog::Bool)
+function is_catalog_okay(catalog, message)
+    # Catalog okay?
+    catalog &&
+        !isempty(message) &&
+        !any(s->occursin(BLS_RESPONSE_CATALOG_FAIL1, s), message) &&
+        !any(s->occursin(BLS_RESPONSE_CATALOG_FAIL2, s), message)
+end
 
+
+# Worker method for a single request
+function _get_data(b::Bls, series::Array{T,1},
+                   startyear::Int, endyear::Int, catalog::Bool) where {T<:AbstractString}
     n_series = length(series)
 
     # Setup payload
@@ -130,18 +137,19 @@ function _get_data{T<:AbstractString}(b::Bls, series::Array{T,1},
     end
 
     # Submit POST request to BLS
-    response = Requests.post(url; json=payload, headers=headers)
+    body = JSON.json(payload)
+    response = HTTP.request("POST", url, headers, body)
 
     # Check if request succeeded
     status = response.status
     if response.status == 200
-        response_json = Requests.json(response)
+        response_json = JSON.parse(String(copy(response.body)))
         increment_requests!(b)
     elseif response.status == 202
         # A 202 status code can be returned to note that "Your request is processing.". It's
         # unclear how BLS treats this, so we just try to process anyway. Exceptions are
         # expected.
-        response_json = Requests.json(response)
+        response_json = JSON.parse(String(copy(response.body)))
         increment_requests!(b)
     elseif haskey(BLS_STATUS_CODE_REASONS, response.status)
         reason = BLS_STATUS_CODE_REASONS[status]
@@ -161,21 +169,17 @@ function _get_data{T<:AbstractString}(b::Bls, series::Array{T,1},
         else
             "<no message returned>"
         end
-        warn("API request failed with status $(status): $(message)")
+        println("API request failed with status $(status): $(message)")
 
         # Return empty response for each series
         return [EMPTY_RESPONSE() for i in 1:n_series]
     end
 
-    # Catalog okay?
-    catalog_okay = catalog &&
-        !isempty(response_json["message"]) &&
-        !isempty(find(s->contains(s, BLS_RESPONSE_CATALOG_FAIL1), response_json["message"])) &&
-        !isempty(find(s->contains(s, BLS_RESPONSE_CATALOG_FAIL2), response_json["message"]))
+    catalog_okay = is_catalog_okay(catalog, response_json["message"])
 
     # Parse response into DataFrames, one for each series
     @assert n_series == length(response_json["Results"]["series"])
-    out = Array{BlsSeries,1}(n_series)
+    out = Array{BlsSeries,1}(undef, n_series)
     for (i, series) in enumerate(response_json["Results"]["series"])
         seriesID = series["seriesID"]
         catalog_out = if catalog_okay
@@ -187,8 +191,8 @@ function _get_data{T<:AbstractString}(b::Bls, series::Array{T,1},
         catalog_out = join(catalog_out, ". ")
 
         data   = map(parse_period_dict, series["data"])
-        dates  = flipdim([x[1] for x in data],1)
-        values = flipdim([x[2] for x in data],1)
+        dates  = reverse([x[1] for x in data],1)
+        values = reverse([x[2] for x in data],1)
         df = DataFrame(date=dates, value=values)
 
         # Data may not be returned in order, for some reason.
@@ -200,29 +204,29 @@ function _get_data{T<:AbstractString}(b::Bls, series::Array{T,1},
     return out
 end
 
-function parse_period_dict{T<:AbstractString}(dict::Dict{T,Any})
-    value = float(dict["value"])
+function parse_period_dict(dict::Dict{T,Any}) where {T<:AbstractString}
+    value = parse(Float64, dict["value"])
     year  = parse(Int, dict["year"])
 
     period = dict["period"]
     # Monthly data
-    if ismatch(r"M\d\d", period) && period ≠ "M13"
+    if occursin(r"M\d\d", period) && period ≠ "M13"
         month = parse(Int, period[2:3])
-        date = Date(year, month, 1)
+        date = Dates.Date(year, month, 1)
 
     # Quarterly data
-    elseif ismatch(r"Q\d\d", period)
+    elseif occursin(r"Q\d\d", period)
         quarter = parse(Int, period[3])
-        date = Date(year, 3*quarter-2, 1)
+        date = Dates.Date(year, 3*quarter-2, 1)
 
     # Annual data
-    elseif ismatch(r"A\d\d", period)
-        date = Date(year, 1, 1)
+    elseif occursin(r"A\d\d", period)
+        date = Dates.Date(year, 1, 1)
 
     # Not implemented
     else
         error("Data of frequency ", period, " not implemented")
     end
-    
+
     return (date, value)
 end
